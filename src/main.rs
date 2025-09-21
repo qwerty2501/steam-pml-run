@@ -201,9 +201,9 @@ async fn load_file(
     let file_size = fs::metadata(&file_path).await?.len() as usize;
     let need_mlock = {
         let mut cms = cached_mem_size.lock().await;
-        let free_mem = sys.total_memory() - cms.to_be();
+        let lock_size = file_size as u64;
+        let free_mem = sys.free_memory() - lock_size;
         if free_mem > MIN_KEEP_MEM_SIZE {
-            let lock_size = file_size as u64;
             cms.deref_mut().add_assign(lock_size);
             true
         } else {
