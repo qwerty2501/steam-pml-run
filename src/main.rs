@@ -48,8 +48,13 @@ async fn run(args: Vec<String>) -> Result<ExitStatus> {
     )
     .await;
     let status = rc_result?;
-    pl_result?;
+    drops(pl_result?);
     Ok(status)
+}
+fn drops(mems: Vec<MappedMem>) {
+    for mut mem in mems {
+        mem.release();
+    }
 }
 
 async fn run_command(command: String, args: Vec<String>) -> Result<ExitStatus> {
@@ -139,10 +144,7 @@ impl MappedMem {
     fn new(addr: *mut c_void, len: usize) -> Self {
         Self { addr, len }
     }
-}
-
-impl Drop for MappedMem {
-    fn drop(&mut self) {
+    fn release(&mut self) {
         unsafe { munmap(self.addr, self.len) };
     }
 }
