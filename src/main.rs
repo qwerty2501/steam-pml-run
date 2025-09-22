@@ -41,8 +41,8 @@ fn main() -> Result<()> {
 async fn run(args: Vec<String>) -> Result<ExitStatus> {
     let command = args[1].to_owned();
     let args = args[2..].to_owned();
-    let pl_task = smol::spawn(pre_load_files(args.clone()));
     let rc_task = smol::spawn(run_command(command.clone(), args.clone()));
+    let pl_task = smol::spawn(pre_load_files(args.clone()));
     let status = rc_task.await?;
     drops(pl_task.await?);
     Ok(status)
