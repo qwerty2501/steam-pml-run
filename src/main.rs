@@ -10,7 +10,6 @@ use smol::{
 use std::{
     env,
     ffi::{OsStr, c_void},
-    ops::{AddAssign, DerefMut},
     os::fd::{AsFd, AsRawFd},
     path::{Path, PathBuf},
     process::{self, ExitStatus, Stdio},
@@ -42,13 +41,10 @@ fn main() -> Result<()> {
 async fn run(args: Vec<String>) -> Result<ExitStatus> {
     let command = args[1].to_owned();
     let args = args[2..].to_owned();
-    let (rc_result, pl_result) = smol::future::zip(
-        run_command(command.clone(), args.clone()),
-        pre_load_files(args),
-    )
-    .await;
-    let status = rc_result?;
-    drops(pl_result?);
+    let pl_task = smol::spawn(pre_load_files(args.clone()));
+    let rc_task = smol::spawn(run_command(command.clone(), args.clone()));
+    let status = rc_task.await?;
+    drops(pl_task.await?);
     Ok(status)
 }
 fn drops(mems: Vec<MappedMem>) {
@@ -149,6 +145,8 @@ impl MappedMem {
     }
 }
 
+unsafe impl Send for MappedMem {}
+
 async fn load_file_paths(
     file_and_dirs: Vec<PathBuf>,
     sys: &System,
@@ -198,20 +196,22 @@ async fn load_file(
     sys: &System,
     cached_mem_size: Arc<Mutex<u64>>,
 ) -> Result<Option<MappedMem>> {
-    let file_size = fs::metadata(&file_path).await?.len() as usize;
+    let file_path = file_path.as_ref();
+    let file_size = fs::metadata(file_path).await?.len() as usize;
     let need_mlock = {
         let mut cms = cached_mem_size.lock().await;
         let lock_size = file_size as u64;
-        let free_mem = sys.free_memory() - lock_size;
+        let free_mem = sys.total_memory() - *cms - lock_size;
         if free_mem > MIN_KEEP_MEM_SIZE {
-            cms.deref_mut().add_assign(lock_size);
+            *cms += lock_size;
             true
         } else {
             false
         }
     };
+
     if need_mlock {
-        let file = fs::File::open(&file_path).await?;
+        let file = fs::File::open(file_path).await?;
         let fd = file.as_fd();
 
         unsafe {
@@ -224,7 +224,10 @@ async fn load_file(
                 0,
             );
             if mem != MAP_FAILED {
-                mlock(mem, file_size);
+                if mlock(mem, file_size) != 0 {
+                    println!("failed mlock");
+                }
+
                 Ok(Some(MappedMem::new(mem, file_size)))
             } else {
                 Ok(None)
