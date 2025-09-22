@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+macro_rules_attribute = "0.2.2"
 nix = "0.30.1"
 smol = "2.0.2"
+smol-macros = "0.1.1"
 sysinfo = "0.37.0"

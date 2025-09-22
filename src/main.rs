@@ -1,12 +1,14 @@
 use anyhow::{Result, anyhow};
+use macro_rules_attribute::apply;
 use nix::libc::{MAP_FAILED, MAP_SHARED, PROT_READ, mlock, mmap64, munmap};
 use smol::{
-    block_on,
+    Executor,
     fs::{self, read_dir},
     lock::Mutex,
     process::Command,
     stream::StreamExt,
 };
+use smol_macros::main;
 use std::{
     env,
     ffi::{OsStr, c_void},
@@ -24,10 +26,11 @@ const SHADERCACHE: &str = "shadercache";
 
 const MIN_KEEP_MEM_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
-fn main() -> Result<()> {
+#[apply(main!)]
+async fn main(ex: &Executor<'_>) -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() > 2 {
-        let exit_status = block_on(run(args))?;
+        let exit_status = run(args, ex).await?;
         if let Some(code) = exit_status.code() {
             process::exit(code);
         } else {
@@ -38,19 +41,14 @@ fn main() -> Result<()> {
     }
 }
 
-async fn run(args: Vec<String>) -> Result<ExitStatus> {
+async fn run(args: Vec<String>, ex: &Executor<'_>) -> Result<ExitStatus> {
     let command = args[1].to_owned();
     let args = args[2..].to_owned();
-    let rc_task = smol::spawn(run_command(command.clone(), args.clone()));
-    let pl_task = smol::spawn(pre_load_files(args.clone()));
-    let status = rc_task.await?;
-    drops(pl_task.await?);
-    Ok(status)
-}
-fn drops(mems: Vec<MappedMem>) {
-    for mut mem in mems {
-        mem.release();
-    }
+    let rc_task = run_command(command.clone(), args.clone());
+    // Since application exit, all memory free.
+    #[allow(unused_variables)]
+    let pl_task = ex.spawn(pre_load_files(args.clone()));
+    rc_task.await
 }
 
 async fn run_command(command: String, args: Vec<String>) -> Result<ExitStatus> {
@@ -89,8 +87,9 @@ async fn pre_load_files(args: Vec<String>) -> Result<Vec<MappedMem>> {
     println!("{load_files_and_dirs:?}");
     let mut sys = System::new_all();
     sys.refresh_all();
+    let source_available_size = sys.available_memory();
     let cached_mem_size = Arc::new(Mutex::new(0));
-    load_file_paths(load_files_and_dirs, &sys, cached_mem_size).await
+    load_file_paths(load_files_and_dirs, source_available_size, cached_mem_size).await
 }
 
 struct SteamGame {
@@ -133,9 +132,12 @@ fn ditect_app_id(args: &[String]) -> Option<String> {
 }
 
 struct MappedMem {
+    #[allow(dead_code)]
     addr: *mut c_void,
+    #[allow(dead_code)]
     len: usize,
 }
+#[allow(dead_code)]
 impl MappedMem {
     fn new(addr: *mut c_void, len: usize) -> Self {
         Self { addr, len }
@@ -149,14 +151,14 @@ unsafe impl Send for MappedMem {}
 
 async fn load_file_paths(
     file_and_dirs: Vec<PathBuf>,
-    sys: &System,
+    source_available_size: u64,
     cached_mem_size: Arc<Mutex<u64>>,
 ) -> Result<Vec<MappedMem>> {
     let mut tasks = vec![];
     for file_or_dir in file_and_dirs {
         tasks.push(Box::pin(load_path(
-            file_or_dir,
-            sys,
+            file_or_dir.clone(),
+            source_available_size,
             cached_mem_size.clone(),
         )));
     }
@@ -167,33 +169,35 @@ async fn load_file_paths(
     Ok(mms)
 }
 
-async fn load_path(
-    path: impl AsRef<Path>,
-    sys: &System,
+#[allow(clippy::manual_async_fn)]
+fn load_path(
+    path: PathBuf,
+    source_available_size: u64,
     cached_mem_size: Arc<Mutex<u64>>,
-) -> Result<Vec<MappedMem>> {
-    let path = path.as_ref();
-    if path.exists() {
-        if path.is_file() {
-            if let Some(mmap) = load_file(path, sys, cached_mem_size).await? {
-                Ok(vec![mmap])
+) -> impl Future<Output = Result<Vec<MappedMem>>> + Send {
+    async move {
+        if path.exists() {
+            if path.is_file() {
+                if let Some(mmap) = load_file(path, source_available_size, cached_mem_size).await? {
+                    Ok(vec![mmap])
+                } else {
+                    Ok(vec![])
+                }
+            } else if path.is_dir() {
+                Ok(load_dir(path, source_available_size, cached_mem_size).await?)
             } else {
-                Ok(vec![])
+                Err(anyhow!("unknown path."))
             }
-        } else if path.is_dir() {
-            Ok(load_dir(path, sys, cached_mem_size).await?)
         } else {
-            Err(anyhow!("unknown path."))
+            // There is a possibility that the file may be deleted due to other reasons.
+            Ok(vec![])
         }
-    } else {
-        // There is a possibility that the file may be deleted due to other reasons.
-        Ok(vec![])
     }
 }
 
 async fn load_file(
     file_path: impl AsRef<Path>,
-    sys: &System,
+    source_available_size: u64,
     cached_mem_size: Arc<Mutex<u64>>,
 ) -> Result<Option<MappedMem>> {
     let file_path = file_path.as_ref();
@@ -201,8 +205,8 @@ async fn load_file(
     let need_mlock = {
         let mut cms = cached_mem_size.lock().await;
         let lock_size = file_size as u64;
-        let free_mem = sys.total_memory() - *cms - lock_size;
-        if free_mem > MIN_KEEP_MEM_SIZE {
+        let available_mem_size = source_available_size - *cms - lock_size;
+        if available_mem_size > MIN_KEEP_MEM_SIZE {
             *cms += lock_size;
             true
         } else {
@@ -225,7 +229,7 @@ async fn load_file(
             );
             if mem != MAP_FAILED {
                 if mlock(mem, file_size) != 0 {
-                    println!("failed mlock");
+                    println!("failed mlock:{}", file_path.to_str().unwrap());
                 }
 
                 Ok(Some(MappedMem::new(mem, file_size)))
@@ -239,7 +243,7 @@ async fn load_file(
 }
 async fn load_dir(
     dir_path: impl AsRef<Path>,
-    sys: &System,
+    source_available_size: u64,
     cached_mem_size: Arc<Mutex<u64>>,
 ) -> Result<Vec<MappedMem>> {
     let mut paths = vec![];
@@ -247,5 +251,5 @@ async fn load_dir(
     while let Some(entry) = entries.try_next().await? {
         paths.push(entry.path());
     }
-    load_file_paths(paths, sys, cached_mem_size).await
+    load_file_paths(paths, source_available_size, cached_mem_size).await
 }
