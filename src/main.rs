@@ -44,7 +44,7 @@ async fn main(ex: &Executor<'_>) -> Result<()> {
 async fn run(args: Vec<String>, ex: &Executor<'_>) -> Result<ExitStatus> {
     let command = args[1].to_owned();
     let args = args[2..].to_owned();
-    let rc_task = run_command(command.clone(), args.clone());
+    let rc_task = ex.spawn(run_command(command.clone(), args.clone()));
     // Since application exit, all memory free.
     #[allow(unused_variables)]
     let pl_task = ex.spawn(pre_load_files(args.clone()));
